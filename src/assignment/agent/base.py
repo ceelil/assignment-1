@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import yaml
 
 from assignment.env import Environment
 from assignment.agent.tools import INVOKE_SKILL_TOOL
@@ -31,6 +32,40 @@ MAX_OBSERVATION_CHARS = 10_000
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
 COMPACTION_SYSTEM_PROMPT = ""
+
+# Sent back when the model replies without calling a tool. It names no tool or
+# domain, so the shared loop stays usable by every agent.
+NO_TOOL_CALL_MESSAGE = (
+    "Your last response did not contain a tool call, so nothing was executed. "
+    "Continue the task by calling one of the available tools."
+)
+
+
+def _parse_skill_frontmatter(content: str, source: Path) -> tuple[str, str]:
+    """Return (name, description) from a SKILL.md's leading YAML block."""
+
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"{source} must start with a '---' frontmatter line")
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        raise ValueError(f"{source} frontmatter has no closing '---' line") from None
+
+    try:
+        frontmatter = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{source} frontmatter is not valid YAML: {exc}") from exc
+    if not isinstance(frontmatter, dict):
+        raise ValueError(f"{source} frontmatter must be a mapping of keys to values")
+
+    fields = []
+    for key in ("name", "description"):
+        value = frontmatter.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{source} frontmatter needs a non-empty {key!r}")
+        fields.append(value.strip())
+    return fields[0], fields[1]
 
 
 class StepLimitError(Exception):
@@ -152,6 +187,11 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        # The interaction so far, in order: each assistant action, the tool
+        # observations linked to it, and any corrective user messages. The
+        # system and task prompts are kept apart because subclasses set them
+        # after this constructor runs, and build_prompt reads them fresh.
+        self.history: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,7 +204,30 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        skills_path = Path(skills_path)
+        if not skills_path.is_dir():
+            raise ValueError(f"Skills path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+        # Sorted so the catalog order is the same on every machine.
+        for skill_dir in sorted(p for p in skills_path.iterdir() if p.is_dir()):
+            skill_file = skill_dir / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(f"Skill folder {skill_dir} has no SKILL.md")
+
+            content = skill_file.read_text(encoding="utf-8")
+            name, description = _parse_skill_frontmatter(content, skill_file)
+            if name in skills:
+                raise ValueError(
+                    f"Duplicate skill name {name!r} in {skill_file}"
+                )
+            skills[name] = {
+                # Level 1 of progressive disclosure: always in the prompt.
+                "metadata": f"name: {name}\ndescription: {description}",
+                # Level 2: shown only when the model calls invoke_skill.
+                "content": content,
+            }
+        return skills
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -227,7 +290,14 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+
+        # Read-only: building a prompt never changes the agent's state, so it
+        # is safe to call any number of times (token estimates call it too).
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+            *deepcopy(self.history),
+        ]
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -336,7 +406,33 @@ class Agent:
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            while not self.finished:
+                # Check the budget before spending another model call, so a run
+                # makes exactly step_limit calls before giving up.
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent did not finish within {self.step_limit} steps."
+                    )
+
+                # Reason + Act: one model call returns one assistant message,
+                # which may hold text, reasoning, and zero or more tool calls.
+                message = self.query_language_model()
+                self.history.append(message)
+
+                tool_calls = message.get("tool_calls") or []
+                if not tool_calls:
+                    # Text-only reply: keep it (it is part of what happened)
+                    # and answer with a user message, so the conversation stays
+                    # valid and the model is steered back to acting.
+                    self.history.append(
+                        {"role": "user", "content": NO_TOOL_CALL_MESSAGE}
+                    )
+                    continue
+
+                # Observe: one linked tool message per call. The subclass may
+                # set self.finished while executing (for example send_message).
+                observations = self.execute_tool_calls(tool_calls)
+                self.history.extend(observations)
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.
