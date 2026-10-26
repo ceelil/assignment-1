@@ -1,0 +1,14 @@
+diff --git a/src/chess_app/game.py b/src/chess_app/game.py
+index f153e00..4fa7750 100644
+--- a/src/chess_app/game.py
++++ b/src/chess_app/game.py
+@@ -73,6 +73,9 @@ class ChessGame:
+             move = self._parse_move(move_text)
+             self._record_and_push(move)
+             human_state = self._state_unlocked()
++            human_state["human_move"] = move.uci()
++            if human_state["game_over"]:
++                return human_state
+ 
+             engine_move: str | None = None
+             reply = self._choose_engine_move()
