@@ -133,10 +133,102 @@ INVOKE_SKILL_TOOL = {
 # TODO(3.1.a): Define an OpenAI function-tool schema named ``play_move``.
 # It must accept exactly one required string argument named ``move``, explain
 # that moves use UCI notation (for example e2e4), and reject extra arguments.
-PLAY_MOVE_TOOL: dict = {}
+PLAY_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "play_move",
+        "description": (
+            "Play one move for White on the live game board. The server then "
+            "plays Black's reply and returns the new state, including the board, "
+            "Black's move, and whether the game is over.\n"
+            "\n"
+            "Moves use UCI notation: the from-square followed by the to-square, "
+            "for example `e2e4` or `g1f3`. Castling is the king's move, for "
+            "example `e1g1`. A promotion adds the piece letter, for example "
+            "`e7e8q`. An illegal move is rejected and the board is unchanged."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "move": {
+                    "type": "string",
+                    "description": "White's move in UCI notation, e.g. e2e4 or e7e8q.",
+                },
+            },
+            "required": ["move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+SIMULATE_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Inspect a position, or play one hypothetical move in it, without "
+            "touching the live game. Nothing is played on the real board and "
+            "Black does not reply.\n"
+            "\n"
+            "With only `fen`, returns that position: its FEN, squares, side to "
+            "move, legal_moves, check status, and game_over/winner/result. With "
+            "`fen` and `move`, applies exactly one ply (for whichever side is to "
+            "move in the FEN) and returns the position after it. Chain the "
+            "returned `fen` to look further ahead."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": (
+                        "A complete six-field FEN, e.g. the `fen` from the latest "
+                        "state."
+                    ),
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional UCI move to apply, e.g. e2e4 or e7e8q; null to "
+                        "only inspect the position."
+                    ),
+                },
+            },
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
-# TODO()
-RUN_PYTHON_TOOL: dict = {}
+RUN_PYTHON_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Run a Python snippet in the sandbox next to the chess server. Inside "
+            "it, `simulate_move(fen, move=None)` and `play_move(move)` are "
+            "already defined as ordinary synchronous functions that return dicts "
+            "(a failed call raises RuntimeError). Do not import them.\n"
+            "\n"
+            "Use simulate_move to search, then call play_move once at the end to "
+            "commit the chosen move. Returns JSON with the snippet's `stdout`, "
+            "`stderr`, and `error`, followed by the live game state after the "
+            "snippet ran. Print what you want to see."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source code to execute.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}

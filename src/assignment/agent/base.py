@@ -31,7 +31,31 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """You maintain the working memory of an autonomous agent that is partway \
+through a task. You will receive the task, any earlier working memory, and a transcript of the \
+agent's older steps (its actions and the tool results it observed). Those older steps are about \
+to be deleted from the agent's context; your summary is the only record of them that will remain.
+
+Write a concise, factual working memory that lets the agent continue without repeating work. \
+Use these headings, and keep every fact that is still relevant:
+
+- Objective: the goal and any constraints or rules the agent must respect.
+- Key facts: files, functions, paths, and line numbers involved; how the environment is set up.
+- Actions and results: commands run and edits made, with their concrete outcomes \
+(errors seen, test names and pass/fail counts, values printed).
+- Failed approaches: what was tried and did not work, and why.
+- Current status and blockers.
+- Next action: the single most useful next step.
+
+Rules: state facts, not speculation. Do not copy raw tool output; quote only short exact \
+strings that matter (an error message, a test id, a changed line). Merge the earlier working \
+memory with the new steps rather than repeating it. Keep it under 400 words. Output only the \
+working memory."""
+
+# Per-message character budget when an old step is shown to the summarizer.
+# Observations are already capped near 10,000 characters; the summarizer needs
+# the gist, not every line, so this keeps the compaction request itself small.
+COMPACTION_SOURCE_MAX_CHARS = 3_000
 
 # Sent back when the model replies without calling a tool. It names no tool or
 # domain, so the shared loop stays usable by every agent.
@@ -39,6 +63,50 @@ NO_TOOL_CALL_MESSAGE = (
     "Your last response did not contain a tool call, so nothing was executed. "
     "Continue the task by calling one of the available tools."
 )
+
+
+def _clip(text: str, limit: int = COMPACTION_SOURCE_MAX_CHARS) -> str:
+    """Keep both ends of a long string, as format_tool_output does."""
+
+    if len(text) <= limit:
+        return text
+    keep = (limit - 60) // 2
+    return f"{text[:keep]}\n[{len(text) - 2 * keep} characters omitted]\n{text[-keep:]}"
+
+
+def render_transcript(messages: list[dict[str, Any]]) -> str:
+    """Show messages to the summarizer as plain text, one block per message.
+
+    Sending old messages as text inside one user message (rather than as real
+    assistant/tool turns) keeps the request valid without tools, and makes it
+    clear to the summarizer that these are records to summarize, not a
+    conversation to continue.
+    """
+
+    blocks = []
+    for message in messages:
+        role = message.get("role", "unknown")
+        lines = [f"[{role}]"]
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            lines.append(_clip(content))
+        elif isinstance(content, list):
+            # Structured content: keep only the text parts.
+            text = " ".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+            if text.strip():
+                lines.append(_clip(text))
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            lines.append(
+                f"tool call {call.get('id', '')}: {function.get('name')}"
+                f"({_clip(str(function.get('arguments', '')))})"
+            )
+        if role == "tool":
+            lines[0] = f"[tool result for {message.get('tool_call_id', '')}]"
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def _parse_skill_frontmatter(content: str, source: Path) -> tuple[str, str]:
@@ -192,6 +260,9 @@ class Agent:
         # system and task prompts are kept apart because subclasses set them
         # after this constructor runs, and build_prompt reads them fresh.
         self.history: list[dict[str, Any]] = []
+        # Model-written summary of steps that compaction removed from history.
+        # None until the first compaction (Part 2).
+        self.working_memory: str | None = None
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -293,11 +364,24 @@ class Agent:
 
         # Read-only: building a prompt never changes the agent's state, so it
         # is safe to call any number of times (token estimates call it too).
-        return [
+        messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": self.task_prompt},
-            *deepcopy(self.history),
         ]
+        if self.working_memory:
+            # Stands in for the removed steps, between the task and the
+            # steps kept verbatim.
+            messages.append({"role": "user", "content": self._working_memory_message()})
+        messages.extend(deepcopy(self.history))
+        return messages
+
+    def _working_memory_message(self) -> str:
+        return (
+            "Earlier steps of this task were compacted to save context. This is "
+            "the working memory recorded from them:\n"
+            f"<working_memory>\n{self.working_memory}\n</working_memory>\n"
+            "Your most recent steps follow verbatim. Continue from there."
+        )
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -335,9 +419,33 @@ class Agent:
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
 
-        raise NotImplementedError
+        # Split history at the start of the k-th most recent assistant action.
+        # Everything from there on is kept verbatim: each kept action stays
+        # together with all of its linked tool observations, so the prompt
+        # remains a valid conversation. Everything before it is summarized.
+        assistant_indexes = [
+            i for i, m in enumerate(self.history) if m.get("role") == "assistant"
+        ]
+        split = assistant_indexes[-self.compaction_keep_recent_steps]
+        old_steps, recent_steps = self.history[:split], self.history[split:]
 
-        compaction_prompt = []
+        source = f"<task>\n{self.task_prompt}\n</task>\n\n"
+        if self.working_memory:
+            source += (
+                "<previous_working_memory>\n"
+                f"{self.working_memory}\n"
+                "</previous_working_memory>\n\n"
+            )
+        source += (
+            "<steps_to_summarize>\n"
+            f"{render_transcript(old_steps)}\n"
+            "</steps_to_summarize>\n\n"
+            "Write the updated working memory."
+        )
+        compaction_prompt = [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": source},
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -350,6 +458,18 @@ class Agent:
 
         # Use `compaction_response` to update what `build_prompt` emits, but
         # DO NOT modify the object itself. Let the method return it unchanged.
+        summary = (compaction_response.choices[0].message.content or "").strip()
+        if summary:
+            self.working_memory = summary
+            self.history = recent_steps
+        else:
+            # An empty summary (for example, the token budget went to
+            # reasoning) would erase the old steps with nothing in their place.
+            # Keep the context as it was; the event is still logged.
+            print(
+                "[agent] compaction returned an empty summary; context kept",
+                flush=True,
+            )
 
         ### Do not modify this section ###
         return compaction_prompt, compaction_response.model_dump(mode="json")
@@ -413,6 +533,10 @@ class Agent:
                     raise StepLimitError(
                         f"Agent did not finish within {self.step_limit} steps."
                     )
+
+                # Summarize old steps first if the context has grown too big.
+                # A no-op when compaction is off or the threshold is not met.
+                self.maybe_compact_context()
 
                 # Reason + Act: one model call returns one assistant message,
                 # which may hold text, reasoning, and zero or more tool calls.
