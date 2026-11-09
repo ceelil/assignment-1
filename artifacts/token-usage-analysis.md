@@ -13,6 +13,8 @@ Both runs fixed the bug the same way: in `QuerySet.bulk_update()` the check
 `isinstance(attr, Expression)` became `hasattr(attr, "resolve_expression")`, so `F()`
 (which subclasses `Combinable`, not `Expression`) is treated as an expression. The baseline
 patch also removed the now-unused `Expression` import.
+The compacted run's patch passes `make check-swebench INSTANCE=django__django-15368`
+(`RESOLVED: yes`).
 
 ## Results
 
